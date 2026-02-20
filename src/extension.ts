@@ -46,6 +46,38 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel.appendLine("[Extension] Activating Stellar Suite extension...");
   console.log("[Stellar Suite] Extension activating...");
 
+        // Register group commands
+        registerGroupCommands(context, groupService);
+        outputChannel.appendLine('[Extension] Group commands registered');
+
+        // Initialize version tracker
+        versionTracker = new ContractVersionTracker(context, outputChannel);
+        outputChannel.appendLine('[Extension] Contract version tracker initialized');
+
+        // Initialize RPC retry service with circuit breaker
+        retryService = new RpcRetryService(
+            { resetTimeout: 60000, consecutiveFailuresThreshold: 3 },
+            { maxAttempts: 3, initialDelayMs: 100, maxDelayMs: 5000 },
+            false
+        );
+        retryStatusBar = new RetryStatusBarItem(retryService, 5000);
+        registerRetryCommands(context, retryService);
+        outputChannel.appendLine('[Extension] RPC retry service with circuit breaker initialized');
+
+        // Initialize workspace state synchronization
+        syncService = new WorkspaceStateSyncService(context);
+        syncStatusProvider = new SyncStatusProvider(syncService);
+        outputChannel.appendLine('[Extension] Workspace state sync service initialized');
+
+        // ── Sidebar ───────────────────────────────────────────
+        sidebarProvider = new SidebarViewProvider(context.extensionUri, context);
+        context.subscriptions.push(
+            vscode.window.registerWebviewViewProvider(
+                SidebarViewProvider.viewType,
+                sidebarProvider
+            )
+        );
+        outputChannel.appendLine('[Extension] Sidebar view provider registered');
   try {
     // Initialize simulation history service
     simulationHistoryService = new SimulationHistoryService(context, outputChannel);
@@ -159,20 +191,30 @@ export function activate(context: vscode.ExtensionContext) {
       },
     );
 
-    const deployFromSidebarCommand = vscode.commands.registerCommand(
-      "stellarSuite.deployFromSidebar",
-      () => deployContract(context, sidebarProvider),
-    );
+        outputChannel.appendLine('[Extension] All commands registered');
 
-    const simulateFromSidebarCommand = vscode.commands.registerCommand(
-      "stellarSuite.simulateFromSidebar",
-      () => simulateTransaction(context, sidebarProvider, simulationHistoryService),
-    );
+        // ── File watcher ──────────────────────────────────────
+        const watcher = vscode.workspace.createFileSystemWatcher('**/{Cargo.toml,*.wasm}');
+        const refreshOnChange = () => sidebarProvider?.refresh();
+        watcher.onDidChange(refreshOnChange);
+        watcher.onDidCreate(refreshOnChange);
+        watcher.onDidDelete(refreshOnChange);
 
-    // ── Context menu commands (callable from Command Palette) ──
-    //
-    // These mirror the context menu actions so power users can
-    // also trigger them via Ctrl+Shift+P.
+        context.subscriptions.push(
+            simulateCommand,
+            deployCommand,
+            buildCommand,
+            configureCliCommand,
+            refreshCommand,
+            deployFromSidebarCommand,
+            simulateFromSidebarCommand,
+            copyContractIdCommand,
+            showVersionMismatchesCommand,
+            watcher,
+            syncStatusProvider || { dispose: () => {} },
+            retryStatusBar || { dispose: () => {} },
+            retryService
+        );
 
     const copyContractIdCommand = vscode.commands.registerCommand(
       "stellarSuite.copyContractId",
