@@ -217,6 +217,23 @@
           "default": "https://soroban-testnet.stellar.org:443",
           "description": "Stellar RPC endpoint URL for transaction simulation"
         },
+        "stellarSuite.rpcEndpoints": {
+          "type": "array",
+          "default": [
+            {
+              "url": "https://soroban-testnet.stellar.org:443",
+              "priority": 0,
+              "enabled": true,
+              "name": "Default Testnet"
+            }
+          ],
+          "description": "List of Stellar RPC endpoints for fallback and health monitoring."
+        },
+        "stellarSuite.automaticFailover": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically failover to the next healthy RPC endpoint if the current one fails."
+        },
         "stellarSuite.useLocalCli": {
           "type": "boolean",
           "default": true,
