@@ -23,6 +23,7 @@ export class MockCliOutputStreamingService extends CliOutputStreamingService {
         stderr: '',
     };
     public lastRequest?: CliOutputStreamingRequest;
+    public requests: CliOutputStreamingRequest[] = [];
     public callCount = 0;
 
     public setResponse(argsInclude: string, response: MockCliResponse): void {
@@ -36,6 +37,7 @@ export class MockCliOutputStreamingService extends CliOutputStreamingService {
     public override async run(request: CliOutputStreamingRequest): Promise<CliOutputStreamingResult> {
         this.callCount++;
         this.lastRequest = request;
+        this.requests.push(request);
         const startedAt = Date.now();
 
         // Find matching response based on arguments
