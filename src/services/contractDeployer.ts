@@ -13,12 +13,14 @@ import {
     logCliError,
     parseCliErrorOutput,
 } from '../utils/cliErrorParser';
+import { DeploymentRetryService, RetryDeploymentParams } from './deploymentRetryService';
+import { DeploymentRetryConfig, DeploymentRetryRecord } from '../types/deploymentRetry';
 
 function getEnvironmentWithPath(): NodeJS.ProcessEnv {
     const env = { ...process.env };
     const homeDir = os.homedir();
     const cargoBin = path.join(homeDir, '.cargo', 'bin');
-    
+
     const additionalPaths = [
         cargoBin,
         path.join(homeDir, '.local', 'bin'),
@@ -26,11 +28,11 @@ function getEnvironmentWithPath(): NodeJS.ProcessEnv {
         '/opt/homebrew/bin',
         '/opt/homebrew/sbin'
     ];
-    
+
     const currentPath = env.PATH || env.Path || '';
     env.PATH = [...additionalPaths, currentPath].filter(Boolean).join(path.delimiter);
     env.Path = env.PATH;
-    
+
     return env;
 }
 
@@ -83,12 +85,72 @@ export class ContractDeployer {
     private source: string;
     private network: string;
     private readonly streamingService: CliOutputStreamingService;
+    private readonly retryService: DeploymentRetryService;
 
-    constructor(cliPath: string, source: string = 'dev', network: string = 'testnet') {
+    constructor(
+        cliPath: string,
+        source: string = 'dev',
+        network: string = 'testnet',
+        streamingService?: CliOutputStreamingService,
+        retryService?: DeploymentRetryService
+    ) {
         this.cliPath = cliPath;
         this.source = source;
         this.network = network;
-        this.streamingService = new CliOutputStreamingService();
+        this.streamingService = streamingService || new CliOutputStreamingService();
+        this.retryService = retryService || new DeploymentRetryService();
+    }
+
+    /**
+     * Deploy a contract with automatic retry and exponential backoff.
+     *
+     * Wraps {@link deployContract} with configurable retry logic. Transient
+     * failures (network errors, timeouts, rate limits) are retried automatically;
+     * permanent failures (invalid WASM, auth errors) are surfaced immediately.
+     *
+     * @param wasmPath     Path to the compiled WASM file
+     * @param retryConfig  Optional retry policy overrides
+     * @returns            The completed retry session record
+     */
+    async deployWithRetry(
+        wasmPath: string,
+        retryConfig?: DeploymentRetryConfig
+    ): Promise<DeploymentRetryRecord> {
+        const params: RetryDeploymentParams = {
+            wasmPath,
+            network: this.network,
+            source: this.source,
+            cliPath: this.cliPath,
+            retryConfig,
+        };
+        return this.retryService.deploy(params);
+    }
+
+    /**
+     * Cancel an active retry-managed deployment by its session ID.
+     *
+     * @param sessionId  The session ID returned by {@link deployWithRetry}
+     * @returns          `true` if the session was found and cancelled
+     */
+    cancelRetry(sessionId: string): boolean {
+        return this.retryService.cancel(sessionId);
+    }
+
+    /**
+     * Retrieve the retry history for deployments run through this deployer instance.
+     */
+    getRetryHistory(): DeploymentRetryRecord[] {
+        return this.retryService.getHistory();
+    }
+
+    /**
+     * Register a callback to receive live retry status events.
+     * Returns a disposer that removes the listener.
+     */
+    onRetryStatusChange(
+        listener: Parameters<DeploymentRetryService['onStatusChange']>[0]
+    ): () => void {
+        return this.retryService.onStatusChange(listener);
     }
 
     async buildContract(
@@ -153,7 +215,7 @@ export class ContractDeployer {
 
             const wasmMatch = output.match(/target\/wasm32[^\/]*\/release\/[^\s]+\.wasm/);
             let wasmPath: string | undefined;
-            
+
             if (wasmMatch) {
                 wasmPath = path.join(contractPath, wasmMatch[0]);
             } else {
@@ -161,7 +223,7 @@ export class ContractDeployer {
                     path.join(contractPath, 'target', 'wasm32v1-none', 'release', '*.wasm'),
                     path.join(contractPath, 'target', 'wasm32-unknown-unknown', 'release', '*.wasm')
                 ];
-                
+
                 for (const pattern of commonPaths) {
                     const dir = path.dirname(pattern);
                     if (fs.existsSync(dir)) {
@@ -289,7 +351,7 @@ export class ContractDeployer {
                     deployOutput: output,
                 };
             }
-            
+
             // Parse output to extract Contract ID and transaction hash
             // Typical output format:
             // "Contract ID: C..."
@@ -378,7 +440,7 @@ export class ContractDeployer {
     ): Promise<DeploymentResult> {
         // First build
         const buildResult = await this.buildContract(contractPath, options);
-        
+
         if (!buildResult.success) {
             return {
                 success: false,

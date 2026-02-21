@@ -1,29 +1,19 @@
 import * as vscode from 'vscode';
-import { SorobanCliService, SimulationResult } from '../services/sorobanCliService';
+import { SorobanCliService } from '../services/sorobanCliService';
 import { RpcService } from '../services/rpcService';
 import { ContractInspector, ContractFunction } from '../services/contractInspector';
 import { WorkspaceDetector } from '../utils/workspaceDetector';
 import { SimulationPanel } from '../ui/simulationPanel';
 import { SidebarViewProvider } from '../ui/sidebarView';
+import { parseFunctionArgs } from '../utils/jsonParser';
 import { formatError } from '../utils/errorFormatter';
 import { resolveCliConfigurationForCommand } from '../services/cliConfigurationVscode';
 import { SimulationValidationService } from '../services/simulationValidationService';
-import { SimulationHistoryService } from '../services/simulationHistoryService';
-import { RpcFallbackService } from '../services/rpcFallbackService';
-import { ResourceProfilingService } from '../services/resourceProfilingService';
-import { StateCaptureService } from '../services/stateCaptureService';
-import { StateDiffService } from '../services/stateDiffService';
-import { CliHistoryService } from '../services/cliHistoryService';
+import { ContractWorkspaceStateService } from '../services/contractWorkStateService';
+import { InputSanitizationService } from '../services/inputSanitizationService';
 
-export async function simulateTransaction(
-    context: vscode.ExtensionContext,
-    sidebarProvider?: SidebarViewProvider,
-    historyService?: SimulationHistoryService,
-    cliHistoryService?: CliHistoryService,
-    fallbackService?: RpcFallbackService,
-    profilingService?: ResourceProfilingService,
-    initialContractId?: string
-): Promise<void> {
+export async function simulateTransaction(context: vscode.ExtensionContext, sidebarProvider?: SidebarViewProvider) {
+    const sanitizer = new InputSanitizationService();
     try {
         const resolvedCliConfig = await resolveCliConfigurationForCommand(context);
         if (!resolvedCliConfig.validation.valid) {
@@ -38,8 +28,10 @@ export async function simulateTransaction(
         const source = resolvedCliConfig.configuration.source;
         const network = resolvedCliConfig.configuration.network;
         const rpcUrl = resolvedCliConfig.configuration.rpcUrl;
-
-        const lastContractId = context.workspaceState.get<string>('lastContractId');
+        
+        const workspaceStateService = new ContractWorkspaceStateService(context, { appendLine: () => {} });
+        await workspaceStateService.initialize();
+        const lastContractId = context.workspaceState.get<string>('stellarSuite.lastContractId') ?? '';
 
         let defaultContractId = lastContractId || '';
         try {
@@ -49,44 +41,91 @@ export async function simulateTransaction(
                     defaultContractId = detectedId;
                 }
             }
-        } catch {
-            // Ignore detection errors
+        } catch (error) {
         }
 
-        const contractId = await vscode.window.showInputBox({
-            prompt: 'Enter contract ID',
-            value: initialContractId || defaultContractId
+        const rawContractId = await vscode.window.showInputBox({
+            prompt: 'Enter the contract ID (address)',
+            placeHolder: defaultContractId || 'e.g., C...',
+            value: defaultContractId,
+            validateInput: (value: string) => {
+                const result = sanitizer.sanitizeContractId(value, { field: 'contractId' });
+                if (!result.valid) {
+                    return result.errors[0];
+                }
+                return null;
+            }
         });
 
-        if (!contractId) {
-            return;
+        if (rawContractId === undefined) {
+            return; // User cancelled
         }
 
-        await context.workspaceState.update('lastContractId', contractId);
-
-        const inspector = new ContractInspector(cliPath, source, network);
-        const contractFunctions: ContractFunction[] =
-            await inspector.getContractFunctions(contractId);
-
-        if (!contractFunctions || contractFunctions.length === 0) {
-            vscode.window.showErrorMessage('No contract functions found.');
+        const contractIdResult = sanitizer.sanitizeContractId(rawContractId, { field: 'contractId' });
+        if (!contractIdResult.valid) {
+            vscode.window.showErrorMessage(`Invalid contract ID: ${contractIdResult.errors[0]}`);
             return;
         }
+        const contractId = contractIdResult.sanitizedValue;
 
-        const functionName = await vscode.window.showQuickPick(
-            contractFunctions.map(fn => fn.name),
-            { placeHolder: 'Select function to simulate' }
-        );
+        await context.workspaceState.update('stellarSuite.lastContractId', contractId);
 
-        if (!functionName) {
-            return;
+        // Get the function name to call
+        const rawFunctionName = await vscode.window.showInputBox({
+            prompt: 'Enter the function name to simulate',
+            placeHolder: 'e.g., transfer',
+            validateInput: (value: string) => {
+                const result = sanitizer.sanitizeFunctionName(value, { field: 'functionName' });
+                if (!result.valid) {
+                    return result.errors[0];
+                }
+                return null;
+            }
+        });
+
+        if (rawFunctionName === undefined) {
+            return; // User cancelled
         }
 
-        const selectedFunction = contractFunctions.find(fn => fn.name === functionName) || null;
+        const functionNameResult = sanitizer.sanitizeFunctionName(rawFunctionName, { field: 'functionName' });
+        if (!functionNameResult.valid) {
+            vscode.window.showErrorMessage(`Invalid function name: ${functionNameResult.errors[0]}`);
+            return;
+        }
+        const functionName = functionNameResult.sanitizedValue;
 
-        let args: any[] = [];
+// Get function info and parameters
+const inspector = new ContractInspector(useLocalCli ? cliPath : rpcUrl, source);
+const contractFunctions = await inspector.getContractFunctions(contractId);
+const selectedFunction = contractFunctions.find(f => f.name === functionName);
 
-        if (selectedFunction?.parameters && selectedFunction.parameters.length > 0) {
+let args: any[] = [];
+
+if (selectedFunction && selectedFunction.parameters.length > 0) {
+    // Show function parameters
+    const paramInput = await vscode.window.showInputBox({
+        prompt: `Enter arguments for ${functionName}(${selectedFunction.parameters.map((i: { name: string; type?: string }) => `${i.name}: ${i.type ?? 'any'}`).join(', ')})`,
+        placeHolder: 'e.g., {"name": "world"}'
+    });
+
+    if (paramInput === undefined) {
+        return; // User cancelled
+    }
+
+    try {
+        const parsed = JSON.parse(paramInput || '{}');
+        if (typeof parsed === 'object' && !Array.isArray(parsed) && parsed !== null) {
+            args = [parsed];
+        } else {
+            vscode.window.showErrorMessage('Arguments must be a JSON object');
+            return;
+        }
+    } catch (error) {
+        vscode.window.showErrorMessage(`Invalid JSON: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return;
+    }
+} else {
+    // No parameters or couldn't get function info - use manual input
             const argsInput = await vscode.window.showInputBox({
                 prompt: 'Enter function arguments as JSON object (e.g., {"name": "value"})',
                 placeHolder: 'e.g., {"name": "world"}',
@@ -94,7 +133,7 @@ export async function simulateTransaction(
             });
 
             if (argsInput === undefined) {
-                return;
+                return; // User cancelled
             }
 
             try {
@@ -106,20 +145,18 @@ export async function simulateTransaction(
                     return;
                 }
             } catch (error) {
-                vscode.window.showErrorMessage(
-                    `Invalid JSON: ${error instanceof Error ? error.message : 'Unknown error'
-                    }`
-                );
+                vscode.window.showErrorMessage(`Invalid JSON: ${error instanceof Error ? error.message : 'Unknown error'}`);
                 return;
             }
         }
 
+        // Validate simulation input and predict possible failures before execution
         const validationService = new SimulationValidationService();
         const validationReport = validationService.validateSimulation(
             contractId,
             functionName,
             args,
-            selectedFunction,
+            selectedFunction ?? null,
             contractFunctions
         );
 
@@ -127,12 +164,16 @@ export async function simulateTransaction(
             ...validationReport.warnings,
             ...validationReport.predictedErrors
                 .filter(prediction => prediction.severity === 'warning')
-                .map(prediction => `${prediction.code}: ${prediction.message}`)
+                .map(prediction => `${prediction.code}: ${prediction.message}`),
         ];
 
         if (!validationReport.valid) {
-            const validationErrorMessage = validationReport.errors.join('\n');
-            const suggestions = [...(validationReport.suggestions || [])];
+            const validationErrorMessage = [
+                ...validationReport.errors,
+                ...(validationReport.suggestions.length > 0
+                    ? ['Suggestions:', ...validationReport.suggestions.map(suggestion => `- ${suggestion}`)]
+                    : []),
+            ].join('\n');
 
             const panel = SimulationPanel.createOrShow(context);
             panel.updateResults(
@@ -140,17 +181,15 @@ export async function simulateTransaction(
                     success: false,
                     error: `Simulation validation failed before execution.\n\n${validationErrorMessage}`,
                     errorSummary: validationReport.errors[0],
-                    errorSuggestions: suggestions,
-                    validationWarnings
+                    errorSuggestions: validationReport.suggestions,
+                    validationWarnings,
                 },
                 contractId,
                 functionName,
                 args
             );
 
-            vscode.window.showErrorMessage(
-                `Simulation validation failed: ${validationReport.errors[0]}`
-            );
+            vscode.window.showErrorMessage(`Simulation validation failed: ${validationReport.errors[0]}`);
             return;
         }
 
@@ -163,13 +202,12 @@ export async function simulateTransaction(
             );
 
             if (selection !== 'Continue') {
-                vscode.window.showInformationMessage(
-                    'Simulation cancelled due to validation warning.'
-                );
+                vscode.window.showInformationMessage('Simulation cancelled due to validation warning.');
                 return;
             }
         }
 
+        // Create and show the simulation panel
         const panel = SimulationPanel.createOrShow(context);
         panel.updateResults(
             { success: false, error: 'Running simulation...', validationWarnings },
@@ -178,6 +216,7 @@ export async function simulateTransaction(
             args
         );
 
+        // Show progress indicator
         await vscode.window.withProgress(
             {
                 location: vscode.ProgressLocation.Notification,
@@ -187,152 +226,56 @@ export async function simulateTransaction(
             async (progress: vscode.Progress<{ message?: string; increment?: number }>) => {
                 progress.report({ increment: 0, message: 'Initializing...' });
 
-                const stateCaptureService = new StateCaptureService();
-                const stateDiffService = new StateDiffService();
-                const baselineBeforeState = stateCaptureService.captureBeforeState(undefined);
-
-                let result: SimulationResult;
-                const simulationStartTime = Date.now();
-                let simulationMethod: 'cli' | 'rpc' = useLocalCli ? 'cli' : 'rpc';
+                let result;
 
                 if (useLocalCli) {
+                    // Use local CLI
                     progress.report({ increment: 30, message: 'Using Stellar CLI...' });
+                    
+                    // Try to find CLI if configured path doesn't work
+let actualCliPath = cliPath;
+let cliService = new SorobanCliService(actualCliPath, source);
 
-                    let actualCliPath = cliPath;
-                    let cliService = new SorobanCliService(actualCliPath, source, cliHistoryService);
-
-                    try {
-                        progress.report({ increment: 50, message: 'Executing simulation...' });
-                        result = await cliService.simulateTransaction(
-                            contractId,
-                            functionName,
-                            args,
-                            network
-                        );
-                    } catch {
-                        const foundPath = await SorobanCliService.findCliPath();
-                        const suggestion = foundPath
+if (!await cliService.isAvailable()) {
+    const foundPath = await SorobanCliService.findCliPath();
+                        const suggestion = foundPath 
                             ? `\n\nFound Stellar CLI at: ${foundPath}\nUpdate your stellarSuite.cliPath setting to: "${foundPath}"`
                             : '\n\nCommon locations:\n- ~/.cargo/bin/stellar\n- /usr/local/bin/stellar\n\nOr install Stellar CLI: https://developers.stellar.org/docs/tools/cli';
-
+                        
                         result = {
                             success: false,
                             error: `Stellar CLI not found at "${cliPath}".${suggestion}`
                         };
+                    } else {
+                        progress.report({ increment: 50, message: 'Executing simulation...' });
+                        result = await cliService.simulateTransaction(contractId, functionName, args, network);
                     }
                 } else {
+                    // Use RPC
                     progress.report({ increment: 30, message: 'Connecting to RPC...' });
-
-                    if (fallbackService) {
-                        progress.report({ increment: 50, message: 'Executing simulation (with failover)...' });
-                        result = await fallbackService.simulateTransaction(
-                            contractId,
-                            functionName,
-                            args
-                        );
-                    } else {
-                        const rpcService = new RpcService(rpcUrl);
-                        progress.report({ increment: 50, message: 'Executing simulation...' });
-                        result = await rpcService.simulateTransaction(
-                            contractId,
-                            functionName,
-                            args
-                        );
-                    }
+                    const rpcService = new RpcService(rpcUrl);
+                    
+                    progress.report({ increment: 50, message: 'Executing simulation...' });
+                    result = await rpcService.simulateTransaction(contractId, functionName, args);
                 }
 
-                const durationMs = Date.now() - simulationStartTime;
                 progress.report({ increment: 100, message: 'Complete' });
 
-                let stateSnapshotBefore = baselineBeforeState;
-                let stateSnapshotAfter = stateCaptureService.captureAfterState(undefined);
-                let stateDiff = stateDiffService.calculateDiff(stateSnapshotBefore, stateSnapshotAfter);
+                // Update panel with results
+                panel.updateResults({ ...result, validationWarnings }, contractId, functionName, args);
 
-                try {
-                    const captured = stateCaptureService.captureSnapshots(result.rawResult ?? result.result);
-                    stateSnapshotBefore = captured.before.entries.length > 0
-                        ? captured.before
-                        : baselineBeforeState;
-                    stateSnapshotAfter = captured.after;
-                    stateDiff = stateDiffService.calculateDiff(stateSnapshotBefore, stateSnapshotAfter);
-                } catch (stateError) {
-                    console.warn('[Stellar Suite] Failed to capture state diff:', stateError);
-                }
-
-                const enrichedResult: SimulationResult = {
-                    ...result,
-                    validationWarnings,
-                    stateSnapshotBefore,
-                    stateSnapshotAfter,
-                    stateDiff,
-                };
-
-                // Record simulation in history
-                let historyEntryId: string | undefined;
-                if (historyService) {
-                    try {
-                        const entry = await historyService.recordSimulation({
-                            contractId,
-                            functionName,
-                            args,
-                            outcome: enrichedResult.success ? 'success' : 'failure',
-                            result: enrichedResult.result,
-                            error: enrichedResult.error,
-                            errorType: enrichedResult.errorType,
-                            resourceUsage: enrichedResult.resourceUsage,
-                            network,
-                            source,
-                            method: simulationMethod,
-                            durationMs,
-                            stateSnapshotBefore,
-                            stateSnapshotAfter,
-                            stateDiff,
-                        });
-                        historyEntryId = entry.id;
-                    } catch (historyError) {
-                        // History recording should never block the simulation flow
-                        console.warn('[Stellar Suite] Failed to record simulation history:', historyError);
-                    }
-                }
-
-                // Record resource profile
-                if (profilingService && enrichedResult.success) {
-                    try {
-                        await profilingService.recordProfile({
-                            simulationId: historyEntryId,
-                            contractId,
-                            functionName,
-                            network,
-                            cpuInstructions: enrichedResult.resourceUsage?.cpuInstructions,
-                            memoryBytes: enrichedResult.resourceUsage?.memoryBytes,
-                            executionTimeMs: durationMs,
-                        });
-                    } catch (profilingError) {
-                        console.warn('[Stellar Suite] Failed to record resource profile:', profilingError);
-                    }
-                }
-
-                // Update panel with final results
-                panel.updateResults(enrichedResult, contractId, functionName, args);
-
+                // Update sidebar view
                 if (sidebarProvider) {
-                    sidebarProvider.showSimulationResult(contractId, enrichedResult);
+                    sidebarProvider.showSimulationResult(contractId, result);
                 }
 
-                if (enrichedResult.success) {
-                    if (stateDiff.summary.totalChanges > 0) {
-                        vscode.window.showInformationMessage(
-                            `Simulation completed successfully (${stateDiff.summary.totalChanges} state change${stateDiff.summary.totalChanges === 1 ? '' : 's'} detected)`
-                        );
-                    } else {
-                        vscode.window.showInformationMessage(
-                            'Simulation completed successfully'
-                        );
-                    }
+                // Show notification
+                if (result.success) {
+                    vscode.window.showInformationMessage('Simulation completed successfully');
                 } else {
-                    const notificationMessage = enrichedResult.errorSummary
-                        ? `Simulation failed: ${enrichedResult.errorSummary}`
-                        : `Simulation failed: ${enrichedResult.error}`;
+                    const notificationMessage = result.errorSummary
+                        ? `Simulation failed: ${result.errorSummary}`
+                        : `Simulation failed: ${result.error}`;
                     vscode.window.showErrorMessage(notificationMessage);
                 }
             }

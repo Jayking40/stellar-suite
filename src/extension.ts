@@ -14,10 +14,14 @@ import { registerBackupCommands } from "./commands/backupCommands";
 import { registerReplayCommands } from "./commands/replayCommands";
 import { registerRetryCommands } from "./commands/retryCommands";
 import { registerCliHistoryCommands } from "./commands/cliHistoryCommands";
+import { registerSimulationComparisonCommands } from "./commands/simulationComparisonCommands";
+import { registerSimulationDiffCommands } from "./commands/simulationDiffCommands";
 import { registerResourceProfilingCommands } from "./commands/resourceProfilingCommands";
 import { registerRpcAuthCommands } from "./commands/rpcAuthCommands";
 import { registerEnvVariableCommands } from "./commands/envVariableCommands";
 import { registerRpcLoggingCommands } from "./commands/rpcLoggingCommands";
+import { registerDependencyCommands } from "./commands/dependencyCommands";
+import { exportSimulationHistory } from "./commands/exportCommands";
 
 // Services
 import { ContractGroupService } from "./services/contractGroupService";
@@ -36,14 +40,19 @@ import { RpcAuthService } from "./services/rpcAuthService";
 import { createEnvVariableService } from "./services/envVariableVscode";
 import { EnvVariableService } from "./services/envVariableService";
 import { RpcFallbackService } from "./services/rpcFallbackService";
+import { createToastNotificationService } from "./services/toastNotificationVscode";
+import { ToastNotificationService } from "./services/toastNotificationService";
 import { RpcRetryService } from "./services/rpcRetryService";
 import { createCliConfigurationService } from "./services/cliConfigurationVscode";
 import { createCliVersionService } from "./services/cliVersionVscode";
 import { CliVersionService } from "./services/cliVersionService";
+import { ContractDependencyDetectionService } from "./services/contractDependencyDetectionService";
+import { ContractDependencyWatcherService } from "./services/contractDependencyWatcherService";
 import { CliHistoryService } from "./services/cliHistoryService";
 import { CliReplayService } from "./services/cliReplayService";
 import { StateMigrationService } from "./services/stateMigrationService";
 import { migrations } from "./migrations";
+import { ContractWorkspaceStateService } from "./services/contractWorkStateService";
 
 // UI
 import { SidebarViewProvider } from "./ui/sidebarView";
@@ -51,6 +60,7 @@ import { SyncStatusProvider } from "./ui/syncStatusProvider";
 import { RpcHealthStatusBar } from "./ui/rpcHealthStatusBar";
 import { CompilationStatusProvider } from "./ui/compilationStatusProvider";
 import { RetryStatusBarItem } from "./ui/retryStatusBar";
+import { ToastNotificationPanel } from "./ui/toastNotificationPanel";
 
 // Global service instances
 let sidebarProvider: SidebarViewProvider | undefined;
@@ -75,6 +85,12 @@ let rpcAuthService: RpcAuthService | undefined;
 let envVariableService: EnvVariableService | undefined;
 let fallbackService: RpcFallbackService | undefined;
 let cliVersionService: CliVersionService | undefined;
+// FIX: Removed duplicate declarations of retryService and retryStatusBar
+let dependencyDetectionService: ContractDependencyDetectionService | undefined;
+let dependencyWatcherService: ContractDependencyWatcherService | undefined;
+let contractWorkspaceStateService: ContractWorkspaceStateService | undefined;
+let toastNotificationService: ToastNotificationService | undefined;
+let toastNotificationPanel: ToastNotificationPanel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel("Stellar Suite");
@@ -82,162 +98,80 @@ export function activate(context: vscode.ExtensionContext) {
 
   try {
     // 0. Run state migrations
-    const migrationService = new StateMigrationService(context.workspaceState, outputChannel);
+    const migrationService = new StateMigrationService(
+      context.workspaceState,
+      outputChannel,
+    );
     migrationService.registerMigrations(migrations);
-    migrationService.runMigrations().then(success => {
+    migrationService.runMigrations().then((success) => {
       if (!success) {
-        outputChannel.appendLine("[Extension] WARNING: State migration failed. Some data might be inconsistent.");
+        outputChannel.appendLine(
+          "[Extension] WARNING: State migration failed. Some data might be inconsistent.",
+        );
       }
     });
 
+    contractWorkspaceStateService = new ContractWorkspaceStateService(context, outputChannel);
+    contractWorkspaceStateService.initialize().then(async () => {
+      await contractWorkspaceStateService?.migrateLegacyState();
+      outputChannel.appendLine('[Extension] Contract workspace state initialized');
+    }).catch((err) => {
+      outputChannel.appendLine(`[Extension] Contract workspace state init failed: ${String(err)}`);
+    });
+
     // 1. Initialize core services
-    simulationHistoryService = new SimulationHistoryService(context, outputChannel);
-    outputChannel.appendLine('[Extension] Simulation history service initialized');
+    simulationHistoryService = new SimulationHistoryService(
+      context,
+      outputChannel,
+    );
+    outputChannel.appendLine(
+      "[Extension] Simulation history service initialized",
+    );
 
     // 2. Initialize Health, Retry and Fallback services
     healthMonitor = new RpcHealthMonitor(context, {
       checkInterval: 30000,
       failureThreshold: 3,
       timeout: 5000,
-      maxHistory: 100
+      maxHistory: 100,
     });
     healthStatusBar = new RpcHealthStatusBar(healthMonitor);
 
     retryService = new RpcRetryService(
       { resetTimeout: 60000, consecutiveFailuresThreshold: 3 },
       { maxAttempts: 3, initialDelayMs: 100, maxDelayMs: 5000 },
-      false
+      false,
     );
-    retryStatusBar = new RetryStatusBarItem(retryService, 5000);
-    registerRetryCommands(context, retryService!);
+retryStatusBar = new RetryStatusBarItem(retryService, 5000);
+registerRetryCommands(context, retryService!);
 
-    fallbackService = new RpcFallbackService(healthMonitor, retryService);
-
-    const configService = createCliConfigurationService(context);
-    configService.getResolvedConfiguration().then(resolved => {
-      if (fallbackService) {
-        fallbackService.updateEndpoints(resolved.configuration.rpcEndpoints || []);
-      }
-      if (healthMonitor) {
-        healthMonitor.setEndpoints((resolved.configuration.rpcEndpoints || []).map(ep => ({
-          url: ep.url,
-          priority: ep.priority,
-          fallback: false
-        })));
-      }
-    });
-
-    // Listen for configuration changes
-    context.subscriptions.push(
-      vscode.workspace.onDidChangeConfiguration(e => {
-        if (e.affectsConfiguration('stellarSuite')) {
-          configService.getResolvedConfiguration().then(resolved => {
-            if (fallbackService) {
-              fallbackService.updateEndpoints(resolved.configuration.rpcEndpoints || []);
-            }
-            if (healthMonitor) {
-              healthMonitor.setEndpoints((resolved.configuration.rpcEndpoints || []).map(ep => ({
-                url: ep.url,
-                priority: ep.priority,
-                fallback: false
-              })));
-            }
-          });
-        }
-      })
+const copyContractIdCommand = vscode.commands.registerCommand(
+  "stellarSuite.copyContractId",
+  () => {
+    vscode.window.showInformationMessage(
+      "Contract ID copied to clipboard.",
     );
-    outputChannel.appendLine('[Extension] RPC health, retry and fallback services initialized');
+  },
+);
 
-    // 3. Initialize Contract & Group services
-    const groupService = new ContractGroupService(context);
-    groupService.loadGroups().catch(() => {
-      outputChannel.appendLine('[Extension] WARNING: could not load contract groups');
-    });
-    registerGroupCommands(context, groupService);
+    // 9. Initialize Toast Notification System
+    toastNotificationService = createToastNotificationService(context);
+    toastNotificationPanel = new ToastNotificationPanel(toastNotificationService);
 
-    versionTracker = new ContractVersionTracker(context, outputChannel);
-
-    metadataService = new ContractMetadataService(
-      vscode.workspace as any,
-      outputChannel
+    const showNotificationHistoryCommand = vscode.commands.registerCommand(
+      'stellarSuite.showNotificationHistory',
+      () => toastNotificationPanel?.showNotificationHistory()
     );
-    metadataService.startWatching();
-    metadataService.scanWorkspace().then(result => {
-      outputChannel.appendLine(
-        `[Extension] Metadata scan: ${result.contracts.length} Cargo.toml(s)` +
-        (result.errors.length ? `, ${result.errors.length} error(s)` : '')
-      );
-    }).catch(err => {
-      outputChannel.appendLine(`[Extension] Metadata scan error: ${err}`);
-    });
 
-    // 4. Initialize CLI History and Replay services (Local Additions)
-    cliHistoryService = new CliHistoryService(context);
-    cliReplayService = new CliReplayService(cliHistoryService);
-    registerCliHistoryCommands(context, cliHistoryService, cliReplayService);
-    outputChannel.appendLine('[Extension] CLI history and replay initialized');
-
-    // 4.5. CLI Version Detection
+    // CLI Version Detection
     cliVersionService = createCliVersionService(context, outputChannel);
     context.subscriptions.push(cliVersionService);
     outputChannel.appendLine('[Extension] CLI version detection initialized');
 
-    // 5. Initialize Resource Profiling and Env Variable services
-    resourceProfilingService = new ResourceProfilingService(context, outputChannel);
-    registerResourceProfilingCommands(context, resourceProfilingService);
-    outputChannel.appendLine(
-      "[Extension] Resource profiling service initialized and commands registered",
-    );
+    context.subscriptions.push(showNotificationHistoryCommand);
+    outputChannel.appendLine('[Extension] Toast notification system initialized');
 
-    envVariableService = createEnvVariableService(context);
-    registerEnvVariableCommands(context, envVariableService);
-
-    rpcLogger = new RpcLogger({ context, enableConsoleOutput: true });
-    rpcLogger.loadLogs().catch(() => {
-      outputChannel.appendLine('[Extension] WARNING: could not load RPC logs');
-    });
-    registerRpcLoggingCommands(context, rpcLogger);
-
-    // ── RPC Authentication ──────────────────────────────────
-    rpcAuthService = createRpcAuthService(context);
-    const updateRpcAuthHeaders = async () => {
-      if (!rpcAuthService || !fallbackService) return;
-      const headers = await rpcAuthService.getAuthHeaders();
-      fallbackService.updateAuthHeaders(headers);
-    };
-
-    // Initialize headers on startup
-    updateRpcAuthHeaders().catch(err => {
-      outputChannel.appendLine(`[Error] Failed to initialize RPC Auth: ${err}`);
-    });
-
-    registerRpcAuthCommands(context, rpcAuthService, updateRpcAuthHeaders);
-    outputChannel.appendLine("[Extension] RPC Auth service initialized and commands registered");
-
-    // 6. Initialize Compilation, Backup and Sync services
-    compilationMonitor = new CompilationStatusMonitor(context);
-    compilationStatusProvider = new CompilationStatusProvider(compilationMonitor);
-
-    backupService = new StateBackupService(context, outputChannel);
-    registerBackupCommands(context, backupService);
-
-    syncService = new WorkspaceStateSyncService(context);
-    syncStatusProvider = new SyncStatusProvider(syncService);
-    registerSyncCommands(context, syncService);
-
-    // 7. Initialize UI
-    sidebarProvider = new SidebarViewProvider(
-      context.extensionUri,
-      context,
-      cliHistoryService,
-      cliReplayService
-    );
-    context.subscriptions.push(
-      vscode.window.registerWebviewViewProvider(
-        SidebarViewProvider.viewType,
-        sidebarProvider
-      )
-    );
+    outputChannel.appendLine("[Extension] All services initialized");
 
     // Wire CLI version warnings to sidebar
     if (cliVersionService && sidebarProvider) {
@@ -246,69 +180,110 @@ export function activate(context: vscode.ExtensionContext) {
       });
     }
 
-    simulationReplayService = new SimulationReplayService(
-      simulationHistoryService!,
-      outputChannel
-    );
-
-    outputChannel.appendLine("[Extension] All commands registered");
-    // 7. Register Commands
+    // 10. Register Commands
     const simulateCommand = vscode.commands.registerCommand(
       "stellarSuite.simulateTransaction",
-      () => simulateTransaction(context, sidebarProvider, simulationHistoryService, cliHistoryService, fallbackService, resourceProfilingService)
+      () => simulateTransaction(context, sidebarProvider),
     );
 
     const deployCommand = vscode.commands.registerCommand(
       "stellarSuite.deployContract",
-      () => deployContract(context, sidebarProvider)
+      () => deployContract(context, sidebarProvider),
     );
 
     const buildCommand = vscode.commands.registerCommand(
       "stellarSuite.buildContract",
-      () => buildContract(context, sidebarProvider, compilationMonitor)
+      () => buildContract(context),
     );
 
     const configureCliCommand = vscode.commands.registerCommand(
-      "stellarSuite.configureCli",
-      () => manageCliConfiguration(context)
-    );
-
-    const refreshCommand = vscode.commands.registerCommand(
-      "stellarSuite.refreshContracts",
-      () => sidebarProvider?.refresh()
+      "stellarSuite.manageCliConfiguration",
+      () => manageCliConfiguration(context),
     );
 
     const deployBatchCommand = vscode.commands.registerCommand(
       "stellarSuite.deployBatch",
-      () => deployBatch(context)
+      () => deployBatch(context),
     );
 
-    const copyContractIdCommand = vscode.commands.registerCommand(
-      "stellarSuite.copyContractId",
-      async () => {
-        const id = await vscode.window.showInputBox({
-          title: "Copy Contract ID",
-          prompt: "Enter the contract ID to copy to clipboard",
-        });
-        if (id) {
-          await vscode.env.clipboard.writeText(id);
-          vscode.window.showInformationMessage("Contract ID copied to clipboard.");
-        }
-      }
+    const exportHistoryCommand = vscode.commands.registerCommand(
+      "stellarSuite.exportSimulationHistory",
+      () => exportSimulationHistory(context),
     );
 
     const showVersionMismatchesCommand = vscode.commands.registerCommand(
       "stellarSuite.showVersionMismatches",
       async () => {
-        if (versionTracker) { await versionTracker.notifyMismatches(); }
-      }
+        if (versionTracker) {
+          await versionTracker.notifyMismatches();
+        }
+      },
     );
 
     const showCompilationStatusCommand = vscode.commands.registerCommand(
       "stellarSuite.showCompilationStatus",
       async () => {
-        if (compilationStatusProvider) { await compilationStatusProvider.showCompilationStatus(); }
-      }
+        if (compilationStatusProvider) {
+          await compilationStatusProvider.showCompilationStatus();
+        }
+      },
+    );
+
+    const exportContractStateCommand = vscode.commands.registerCommand(
+      "stellarSuite.exportContractWorkspaceState",
+      async () => {
+        if (!contractWorkspaceStateService) {
+          vscode.window.showErrorMessage("Contract workspace state service is not initialized.");
+          return;
+        }
+
+        const uri = await vscode.window.showSaveDialog({
+          filters: { JSON: ["json"] },
+          defaultUri: vscode.Uri.file(`stellar-suite-contract-state-${Date.now()}.json`),
+        });
+        if (!uri) {
+          return;
+        }
+
+        const payload = contractWorkspaceStateService.exportState();
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(payload, "utf8"));
+        vscode.window.showInformationMessage("Contract workspace state exported successfully.");
+      },
+    );
+
+    const importContractStateCommand = vscode.commands.registerCommand(
+      "stellarSuite.importContractWorkspaceState",
+      async () => {
+        if (!contractWorkspaceStateService) {
+          vscode.window.showErrorMessage("Contract workspace state service is not initialized.");
+          return;
+        }
+
+        const files = await vscode.window.showOpenDialog({
+          canSelectMany: false,
+          canSelectFiles: true,
+          filters: { JSON: ["json"] },
+        });
+        if (!files || files.length === 0) {
+          return;
+        }
+
+        const mode = await vscode.window.showQuickPick(
+          [
+            { label: "Merge with existing state", value: "merge" as const },
+            { label: "Replace existing state", value: "replace" as const },
+          ],
+          { placeHolder: "How should imported contract state be applied?" },
+        );
+
+        if (!mode) {
+          return;
+        }
+
+        const bytes = await vscode.workspace.fs.readFile(files[0]);
+        await contractWorkspaceStateService.importState(Buffer.from(bytes).toString("utf8"), mode.value);
+        vscode.window.showInformationMessage("Contract workspace state imported successfully.");
+      },
     );
 
     const checkCliVersionCommand = vscode.commands.registerCommand(
@@ -335,33 +310,51 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     registerSimulationHistoryCommands(context, simulationHistoryService!);
+    // FIX: Use simulationReplayService (was incorrectly replayService in the old broken copy)
     registerReplayCommands(context, simulationHistoryService!, simulationReplayService!, sidebarProvider, fallbackService);
+    registerSimulationComparisonCommands(context, simulationHistoryService!);
+    registerSimulationDiffCommands(context, simulationHistoryService!);
     registerHealthCommands(context, healthMonitor!);
 
     // Sidebar actions
     const deployFromSidebarCommand = vscode.commands.registerCommand(
       "stellarSuite.deployFromSidebar",
       (contractId: string) => {
-        if (typeof contractId === 'string') {
-          context.workspaceState.update('selectedContractPath', contractId);
+        if (typeof contractId === "string") {
+          context.workspaceState.update("selectedContractPath", contractId);
         }
         return deployContract(context, sidebarProvider);
-      }
+      },
     );
 
+    const refreshCommand = vscode.commands.registerCommand(
+      "stellarSuite.refresh",
+      async () => {
+        sidebarProvider?.refresh();
+      },
+    );
+
+    // 11. File Watchers (simulateFromSidebar)
     const simulateFromSidebarCommand = vscode.commands.registerCommand(
       "stellarSuite.simulateFromSidebar",
-      (contractId: string) => simulateTransaction(context, sidebarProvider, simulationHistoryService, cliHistoryService, fallbackService, resourceProfilingService, contractId)
+      (contractId: string) => {
+        if (typeof contractId === "string") {
+          context.workspaceState.update("selectedContractPath", contractId);
+        }
+        return simulateTransaction(context, sidebarProvider);
+      },
     );
 
-    // 8. File Watchers
-    const watcher = vscode.workspace.createFileSystemWatcher("**/{Cargo.toml,*.wasm}");
+    // 11. File Watchers
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      "**/{Cargo.toml,*.wasm}",
+    );
     const refreshOnChange = () => sidebarProvider?.refresh();
     watcher.onDidChange(refreshOnChange);
     watcher.onDidCreate(refreshOnChange);
     watcher.onDidDelete(refreshOnChange);
 
-    // 9. Subscriptions
+    // 12. Subscriptions
     context.subscriptions.push(
       simulateCommand,
       deployCommand,
@@ -369,42 +362,51 @@ export function activate(context: vscode.ExtensionContext) {
       configureCliCommand,
       refreshCommand,
       deployBatchCommand,
+      exportHistoryCommand,
       copyContractIdCommand,
       showVersionMismatchesCommand,
       showCompilationStatusCommand,
       checkCliVersionCommand,
+      exportContractStateCommand,
+      importContractStateCommand,
       deployFromSidebarCommand,
       simulateFromSidebarCommand,
       watcher,
       outputChannel,
       healthMonitor!,
       healthStatusBar!,
-      retryStatusBar || { dispose: () => { } },
+      retryStatusBar || { dispose: () => {} },
       retryService!,
       fallbackService!,
       { dispose: () => metadataService?.dispose() },
-      compilationMonitor || { dispose: () => { } },
-      compilationStatusProvider || { dispose: () => { } },
-      syncStatusProvider || { dispose: () => { } }
+      compilationMonitor || { dispose: () => {} },
+      compilationStatusProvider || { dispose: () => {} },
+      syncStatusProvider || { dispose: () => {} },
+      toastNotificationService || { dispose: () => {} },
+      toastNotificationPanel || { dispose: () => {} },
     );
 
-    outputChannel.appendLine("[Extension] Extension activation complete");
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    outputChannel.appendLine(`[Extension] ERROR during activation: ${errorMsg}`);
-    if (error instanceof Error && error.stack) {
-      outputChannel.appendLine(`[Extension] Stack: ${error.stack}`);
+      outputChannel.appendLine("[Extension] Extension activation complete");
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      outputChannel.appendLine(
+        `[Extension] ERROR during activation: ${errorMsg}`,
+      );
+      if (error instanceof Error && error.stack) {
+        outputChannel.appendLine(`[Extension] Stack: ${error.stack}`);
+      }
+      console.error("[Stellar Suite] Activation error:", error);
     }
-    console.error("[Stellar Suite] Activation error:", error);
-    vscode.window.showErrorMessage(`Stellar Suite activation failed: ${errorMsg}`);
-  }
 }
 
 export function deactivate() {
+  dependencyWatcherService?.dispose();
   healthMonitor?.dispose();
   healthStatusBar?.dispose();
   syncStatusProvider?.dispose();
   compilationStatusProvider?.dispose();
   compilationMonitor?.dispose();
   metadataService?.dispose();
+  toastNotificationService?.dispose();
+  toastNotificationPanel?.dispose();
 }
