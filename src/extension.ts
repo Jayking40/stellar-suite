@@ -22,6 +22,7 @@ import { registerEnvVariableCommands } from "./commands/envVariableCommands";
 import { registerRpcLoggingCommands } from "./commands/rpcLoggingCommands";
 import { registerDependencyCommands } from "./commands/dependencyCommands";
 import { exportSimulationHistory } from "./commands/exportCommands";
+import { registerOfflineSimulationCommands } from "./commands/offlineSimulationCommands";
 
 // Services
 import { ContractGroupService } from "./services/contractGroupService";
@@ -54,10 +55,14 @@ import { CliReplayService } from "./services/cliReplayService";
 import { StateMigrationService } from "./services/stateMigrationService";
 import { migrations } from "./migrations";
 import { ContractWorkspaceStateService } from "./services/contractWorkStateService";
+import { ContractCacheService } from "./services/contractCacheService";
+import { OfflineModeDetectionService } from "./services/offlineModeDetectionService";
+import { OfflineSimulationService } from "./services/offlineSimulationService";
 
 // UI
 import { SidebarViewProvider } from "./ui/sidebarView";
 import { SyncStatusProvider } from "./ui/syncStatusProvider";
+import { registerSimulationCacheCommands } from './commands/simulationCacheCommands';
 import { RpcHealthStatusBar } from "./ui/rpcHealthStatusBar";
 import { CompilationStatusProvider } from "./ui/compilationStatusProvider";
 import { RetryStatusBarItem } from "./ui/retryStatusBar";
@@ -86,6 +91,9 @@ let resourceProfilingService: ResourceProfilingService | undefined;
 let rpcAuthService: RpcAuthService | undefined;
 let envVariableService: EnvVariableService | undefined;
 let fallbackService: RpcFallbackService | undefined;
+let cacheService: ContractCacheService | undefined;
+let offlineModeDetectionService: OfflineModeDetectionService | undefined;
+let offlineSimulationService: OfflineSimulationService | undefined;
 let cliVersionService: CliVersionService | undefined;
 // FIX: Removed duplicate declarations of retryService and retryStatusBar
 let dependencyDetectionService: ContractDependencyDetectionService | undefined;
@@ -98,6 +106,8 @@ let notificationPreferencesService: NotificationPreferencesService | undefined;
 export function activate(context: vscode.ExtensionContext) {
   const outputChannel = vscode.window.createOutputChannel("Stellar Suite");
   outputChannel.appendLine("[Extension] Activating Stellar Suite extension...");
+  console.log("[Stellar Suite] Extension activating...");
+  registerSimulationCacheCommands(context);
 
   try {
     // 0. Run state migrations
@@ -130,6 +140,17 @@ export function activate(context: vscode.ExtensionContext) {
     outputChannel.appendLine(
       "[Extension] Simulation history service initialized",
     );
+
+    // 1a. Initialize offline simulation services
+    cacheService = new ContractCacheService(context, outputChannel);
+    offlineModeDetectionService = new OfflineModeDetectionService(context, outputChannel);
+    offlineSimulationService = new OfflineSimulationService(
+      cacheService,
+      offlineModeDetectionService,
+      simulationHistoryService,
+      outputChannel
+    );
+    outputChannel.appendLine("[Extension] Offline simulation services initialized");
 
     // 2. Initialize Health, Retry and Fallback services
     healthMonitor = new RpcHealthMonitor(context, {
@@ -323,6 +344,7 @@ const copyContractIdCommand = vscode.commands.registerCommand(
     registerReplayCommands(context, simulationHistoryService!, simulationReplayService!, sidebarProvider, fallbackService);
     registerSimulationComparisonCommands(context, simulationHistoryService!);
     registerSimulationDiffCommands(context, simulationHistoryService!);
+    registerOfflineSimulationCommands(context, offlineSimulationService!, cacheService!, offlineModeDetectionService!, sidebarProvider);
     registerHealthCommands(context, healthMonitor!);
 
     // Sidebar actions
